@@ -1,0 +1,5 @@
+for h in training_data/training_data/*; do
+  output=$(basename "$h" .sp)  # Removes path and .sp extension
+  echo "echo \"Processing: $output\""
+  echo "python3 ir_solver_sparse.py --input_file $h --output_file ${output}.v"
+done
