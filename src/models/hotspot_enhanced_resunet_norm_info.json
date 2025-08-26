@@ -1,0 +1,7 @@
+{
+  "label_normalization": "per_sample_max",
+  "input_normalization": "per_channel_max_abs",
+  "output_activation": "relu",
+  "enhanced_loss": true,
+  "data_augmentation": true
+}

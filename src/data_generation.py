@@ -10,13 +10,12 @@ python3 src/data_generation.py \
 """
 
 DBU = 2000.0          # per assignment note
-GRID = 600            # fixed image size
 
-def node_to_xy(node, grid=GRID):
+def node_to_xy(node, grid_size=None):
     """
     Expect node like: <net>_<layer>_<x>_<y>
     Take the *last two* underscore-separated tokens as x,y in DBU, convert to µm,
-    then map to integer pixel coordinates with clamping.
+    then map to integer pixel coordinates with dynamic grid sizing.
     Returns (x_idx, y_idx) or None for ground/invalid.
     """
     if node == '0' or node is None:
@@ -29,14 +28,21 @@ def node_to_xy(node, grid=GRID):
         y_dbu = float(toks[-1])
         x_um = x_dbu / DBU
         y_um = y_dbu / DBU
-        # Map µm directly to pixels (1 µm -> 1 px). If your chip > 600 µm,
-        # you may want normalization; for now clamp to bounds.
-        x = int(round(x_um))
-        y = int(round(y_um))
+        
+        # If grid_size is provided, use it; otherwise use the actual chip dimensions
+        if grid_size is None:
+            # Dynamic grid sizing based on actual chip dimensions
+            max_dim = max(x_um, y_um)
+            grid_size = max(64, min(1024, int(np.ceil(max_dim * 1.2))))  # 20% padding, min 64, max 1024
+        
+        # Map µm to grid coordinates with proper scaling
+        x = int(round(x_um * grid_size / max(x_um, y_um, 1)))
+        y = int(round(y_um * grid_size / max(x_um, y_um, 1)))
+        
         if x < 0 or y < 0:
             return None
-        x = min(x, grid - 1)
-        y = min(y, grid - 1)
+        x = min(x, grid_size - 1)
+        y = min(y, grid_size - 1)
         return (x, y)
     except Exception:
         return None
@@ -86,9 +92,56 @@ def parse_spice_line(line):
 
     return kind, n1, n2, val
 
-def generate_maps(spice_netlist, voltage_file, output_dir):
+def determine_grid_size(spice_netlist):
+    """
+    Analyze the SPICE netlist to determine appropriate grid size based on node coordinates.
+    """
+    max_x, max_y = 0, 0
+    
+    with open(spice_netlist, 'r') as f:
+        for line in f:
+            rec = parse_spice_line(line)
+            if rec is None:
+                continue
+            kind, n1, n2, val = rec
+            
+            for node in (n1, n2):
+                if node == '0' or node is None:
+                    continue
+                toks = node.split('_')
+                if len(toks) >= 2:
+                    try:
+                        x_dbu = float(toks[-2])
+                        y_dbu = float(toks[-1])
+                        x_um = x_dbu / DBU
+                        y_um = y_dbu / DBU
+                        max_x = max(max_x, x_um)
+                        max_y = max(max_y, y_um)
+                    except Exception:
+                        continue
+    
+    # Determine grid size based on chip dimensions
+    max_dim = max(max_x, max_y)
+    if max_dim == 0:
+        return 256  # Default fallback
+    
+    # Use adaptive grid sizing: 20% padding, minimum 64, maximum 1024
+    grid_size = max(64, min(1024, int(np.ceil(max_dim * 1.2))))
+    
+    # Ensure grid size is a power of 2 for better CNN performance
+    grid_size = 2 ** int(np.log2(grid_size))
+    
+    return grid_size
+
+def generate_maps(spice_netlist, voltage_file, output_dir, grid_size=None):
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(spice_netlist))[0]
+
+    # Determine grid size if not provided
+    if grid_size is None:
+        grid_size = determine_grid_size(spice_netlist)
+    
+    print(f"[INFO] Using grid size: {grid_size}x{grid_size}")
 
     # Load node voltages
     voltages = {}
@@ -102,11 +155,11 @@ def generate_maps(spice_netlist, voltage_file, output_dir):
                 except Exception:
                     continue
 
-    # Init maps
-    current_map   = np.zeros((GRID, GRID), dtype=np.float32)
-    density_map   = np.zeros((GRID, GRID), dtype=np.float32)
-    vsrc_map      = np.zeros((GRID, GRID), dtype=np.float32)
-    ir_drop_map   = np.zeros((GRID, GRID), dtype=np.float32)
+    # Init maps with dynamic grid size
+    current_map   = np.zeros((grid_size, grid_size), dtype=np.float32)
+    density_map   = np.zeros((grid_size, grid_size), dtype=np.float32)
+    vsrc_map      = np.zeros((grid_size, grid_size), dtype=np.float32)
+    ir_drop_map   = np.zeros((grid_size, grid_size), dtype=np.float32)
 
     resistors = []
     currents  = []
@@ -129,7 +182,7 @@ def generate_maps(spice_netlist, voltage_file, output_dir):
     # Voltage source map
     for n1, n2, _vv in vsrcs:
         for node in (n1, n2):
-            xy = node_to_xy(node)
+            xy = node_to_xy(node, grid_size)
             if xy:
                 x, y = xy
                 vsrc_map[y, x] = 1.0
@@ -137,8 +190,8 @@ def generate_maps(spice_netlist, voltage_file, output_dir):
     # Density & current maps
     # Density: increment both endpoints when a resistor is present
     for n1, n2, r in resistors:
-        xy1 = node_to_xy(n1)
-        xy2 = node_to_xy(n2)
+        xy1 = node_to_xy(n1, grid_size)
+        xy2 = node_to_xy(n2, grid_size)
         if xy1:
             safe_add(density_map, *xy1, 1.0)
         if xy2:
@@ -157,7 +210,7 @@ def generate_maps(spice_netlist, voltage_file, output_dir):
     if voltages:
         vmax = max(voltages.values())
         for node, v in voltages.items():
-            xy = node_to_xy(node)
+            xy = node_to_xy(node, grid_size)
             if xy:
                 x, y = xy
                 val = vmax - v
@@ -165,12 +218,18 @@ def generate_maps(spice_netlist, voltage_file, output_dir):
                     val = 0.0
                 ir_drop_map[y, x] = val
 
-    # Save
+    # Save maps with grid size info
     np.savetxt(os.path.join(output_dir, f"current_map_{base}.csv"), current_map, delimiter=",")
     np.savetxt(os.path.join(output_dir, f"pdn_density_map_{base}.csv"), density_map, delimiter=",")
     np.savetxt(os.path.join(output_dir, f"voltage_source_map_{base}.csv"), vsrc_map, delimiter=",")
     np.savetxt(os.path.join(output_dir, f"ir_drop_map_{base}.csv"), ir_drop_map, delimiter=",")
-    print(f"[OK] Maps generated for {base} -> {output_dir}")
+    
+    # Save grid size info for later use
+    grid_info = {"grid_size": grid_size, "base": base}
+    np.savetxt(os.path.join(output_dir, f"grid_info_{base}.txt"), 
+               [grid_size], fmt='%d', header='grid_size')
+    
+    print(f"[OK] Maps generated for {base} -> {output_dir} (grid: {grid_size}x{grid_size})")
 
 
 if __name__ == "__main__":
@@ -182,8 +241,10 @@ if __name__ == "__main__":
                         help="Path to voltage output file from MNA solver")
     parser.add_argument("-output", type=str, required=True,
                         help="Directory to save generated CSV maps")
+    parser.add_argument("-grid_size", type=int, default=None,
+                        help="Grid size (if not specified, will be determined automatically)")
     args = parser.parse_args()
 
-    generate_maps(args.spice_netlist, args.voltage_file, args.output)
+    generate_maps(args.spice_netlist, args.voltage_file, args.output, args.grid_size)
     
 

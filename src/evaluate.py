@@ -1,226 +1,429 @@
 #!/usr/bin/env python3
-import argparse, os, sys, time, csv
+import argparse, os, sys
 import numpy as np
 import torch
+import json
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from scipy.stats import pearsonr
+import cv2
 
-# local imports w/o PYTHONPATH hassles
+# robust local imports
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from data_generation import generate_maps, determine_grid_size
 from ir_solver_sparse import solve_ir_drop
-from data_generation import generate_maps
 
-# --------- helpers ---------
-def select_model():
-    # prefer ResUNet if present, else UNet
-    try:
-        from models.resunet import ResUNet as Net
-        return Net()
-    except Exception:
-        from models.unet import UNet as Net
-        return Net()
-
-def load_model(model_path, device):
-    model = select_model()
-    sd = torch.load(model_path, map_location=device)
-    model.load_state_dict(sd)
-    model.to(device).eval()
-    return model
-
-def load_map(path):
-    arr = np.loadtxt(path, delimiter=",")
-    if np.isnan(arr).any() or np.isinf(arr).any():
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    return arr
-
-def mae(pred, true):
-    return float(np.mean(np.abs(pred - true)))  # volts
-
-def f1_90pct_of_max(pred, true):
-    max_true = float(np.max(true)) if true.size else 0.0
-    if max_true == 0.0:
-        stats = dict(max_true=0.0, thr=0.0, n_pos_true=0, n_pos_pred=0,
-                     TP=0, FP=0, FN=0, precision=1.0, recall=1.0, f1=1.0)
-        return 1.0, stats
-    thr = 0.9 * max_true
-    true_hot = (true >= thr)
-    pred_hot = (pred >= thr)
-    TP = int(np.sum(pred_hot & true_hot))
-    FP = int(np.sum(pred_hot & (~true_hot)))
-    FN = int(np.sum((~pred_hot) & true_hot))
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1 = 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
-    stats = dict(max_true=max_true, thr=thr,
-                 n_pos_true=int(np.sum(true_hot)),
-                 n_pos_pred=int(np.sum(pred_hot)),
-                 TP=TP, FP=FP, FN=FN,
-                 precision=precision, recall=recall, f1=f1)
-    return f1, stats
-
-def ensure_golden(spice_path, gt_dir, debug=False):
-    """Ensure .voltage and ir_drop_map exist in gt_dir for this spice file."""
-    base = os.path.splitext(os.path.basename(spice_path))[0]
-    os.makedirs(gt_dir, exist_ok=True)
-    vfile = os.path.join(gt_dir, f"{base}.voltage")
-    if not os.path.exists(vfile):
-        if debug: print(f"[DEBUG] {base}: solving MNA -> {vfile}")
-        solve_ir_drop(spice_path, vfile)
-    gt_ir = os.path.join(gt_dir, f"ir_drop_map_{base}.csv")
-    if not os.path.exists(gt_ir):
-        if debug: print(f"[DEBUG] {base}: generating GT maps in {gt_dir}")
-        generate_maps(spice_path, vfile, gt_dir)
-    return base, vfile, gt_ir
-
-def _norm(x: np.ndarray) -> np.ndarray:
-    m = float(np.max(np.abs(x)))
-    return x / (m + 1e-12)
-
-def load_features(base, feature_dir):
-    cur  = load_map(os.path.join(feature_dir, f"current_map_{base}.csv"))
-    dens = load_map(os.path.join(feature_dir, f"pdn_density_map_{base}.csv"))
-    vsrc = load_map(os.path.join(feature_dir, f"voltage_source_map_{base}.csv"))
-    # Match training-time normalization: per-channel max-abs scaling
-    X = np.stack([_norm(cur), _norm(dens), _norm(vsrc)], axis=0)  # [3,H,W]
-    return X
-
-def forward_once(model, X, device, gt_ir_map):
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        inp = torch.tensor(X, dtype=torch.float32, device=device).unsqueeze(0)  # [1,3,H,W]
-        out = model(inp).squeeze().cpu().numpy()  # [H,W]
+def load_model(model_path, norm_info_path=None):
+    """
+    Load trained model with proper configuration.
+    """
+    # Load normalization info
+    norm_info = {}
+    if norm_info_path and os.path.exists(norm_info_path):
+        with open(norm_info_path, 'r') as f:
+            norm_info = json.load(f)
     
-    # Denormalize prediction
-    gt_max = np.max(gt_ir_map) if np.max(gt_ir_map) > 0 else 1.0
-    out = out * gt_max
+    # Determine model type from norm_info
+    variable_size = norm_info.get('variable_size', False)
+    target_size = norm_info.get('target_size', 256)
     
-    # Physically IR-drop is non-negative
-    out = np.clip(out, 0.0, None)
-    dt = time.perf_counter() - t0
-    return out, dt
-
-# --------- modes ---------
-def eval_from_spice(spice_dir, model_path, pred_out, gt_out, debug=False, csv_out=None, device="cpu"):
-    device = torch.device(device)
-    model = load_model(model_path, device)
-    os.makedirs(pred_out, exist_ok=True)
-    rows = []
-
-    for fname in sorted(os.listdir(spice_dir)):
-        if not fname.endswith(".sp"): 
-            continue
-        spice_path = os.path.join(spice_dir, fname)
-        base, _vfile, gt_ir_path = ensure_golden(spice_path, gt_out, debug=debug)
-
-        # features are deterministic from netlist+voltages; reuse GT dir to load them
-        X = load_features(base, gt_out)
-        gt_ir_map = load_map(gt_ir_path)
-
-        # time only the model forward (inference time)
-        pred, runtime = forward_once(model, X, device, gt_ir_map)
-        if debug:
-            print(f"[DEBUG] {base}: model inference runtime = {runtime:.4f}s")
-
-        # save prediction
-        pred_path = os.path.join(pred_out, f"predicted_ir_drop_map_{base}.csv")
-        np.savetxt(pred_path, pred, delimiter=",")
-
-        # evaluate
-        true = gt_ir_map
-        m = mae(pred, true)
-        f1, stats = f1_90pct_of_max(pred, true)
-
-        if debug:
-            print(f"[DEBUG] {base}: max_true={stats['max_true']*1000:.3f} mV  thr={stats['thr']*1000:.3f} mV  "
-                  f"pos_true={stats['n_pos_true']} pos_pred={stats['n_pos_pred']}  "
-                  f"TP={stats['TP']} FP={stats['FP']} FN={stats['FN']}  "
-                  f"P={stats['precision']:.3f} R={stats['recall']:.3f} F1={stats['f1']:.3f}")
-
-        rows.append((base, m, f1, runtime, stats))
-
-    print_table(rows)
-    if csv_out:
-        write_csv(rows, csv_out)
-        print(f"[INFO] Wrote CSV: {csv_out}")
-
-def eval_from_dirs(pred_dir, true_dir, debug=False, csv_out=None):
-    rows = []
-    for fname in sorted(os.listdir(pred_dir)):
-        if not (fname.startswith("predicted_ir_drop_map_") and fname.endswith(".csv")):
-            continue
-        base = fname[len("predicted_ir_drop_map_"):-4]
-        pred = load_map(os.path.join(pred_dir, fname))
-        true = load_map(os.path.join(true_dir, f"ir_drop_map_{base}.csv"))
-        m = mae(pred, true)
-        f1, stats = f1_90pct_of_max(pred, true)
-        if debug:
-            print(f"[DEBUG] {base}: max_true={stats['max_true']*1000:.3f} mV  thr={stats['thr']*1000:.3f} mV  "
-                  f"pos_true={stats['n_pos_true']} pos_pred={stats['n_pos_pred']}  "
-                  f"TP={stats['TP']} FP={stats['FP']} FN={stats['FN']}  "
-                  f"P={stats['precision']:.3f} R={stats['recall']:.3f} F1={stats['f1']:.3f}")
-        rows.append((base, m, f1, None, stats))
-    print_table(rows)
-    if csv_out:
-        write_csv(rows, csv_out)
-        print(f"[INFO] Wrote CSV: {csv_out}")
-
-# --------- reporting ---------
-def print_table(rows):
-    print("\nEvaluation Results")
-    print(f"{'Testcase':<16} {'MAE (mV)':>10} {'F1 (>=90% max)':>15} {'Runtime (s)':>12} {'Threshold (mV)':>15}")
-    print("-" * 70)
-    for base, m, f1, rt, s in rows:
-        rt_str = f"{rt:.3f}" if rt is not None else "-"
-        thr_mv = s['thr'] * 1000.0
-        print(f"{base:<16} {m*1000:>10.3f} {f1:>15.3f} {rt_str:>12} {thr_mv:>15.3f}")
-
-    # optional averages
-    if rows:
-        ms = np.mean([m for _, m, *_ in rows]) * 1000.0
-        f1s = np.mean([f1 for *_, f1, _, _ in rows])
-        rts = [rt for *_, rt, _ in rows if rt is not None]
-        rt_avg = np.mean(rts) if rts else None
-        print("-" * 70)
-        print(f"{'Average':<16} {ms:>10.3f} {f1s:>15.3f} {('-' if rt_avg is None else f'{rt_avg:.3f}'):>12} {'':>15}")
-
-def write_csv(rows, path):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["testcase","mae_mV","f1","runtime_s","thr_mV",
-                    "max_true_mV","pos_true","pos_pred","TP","FP","FN","precision","recall"])
-        for base, m, f1, rt, s in rows:
-            w.writerow([base, m*1000.0, f1, ("" if rt is None else rt),
-                        s['thr']*1000.0, s['max_true']*1000.0, s['n_pos_true'], s['n_pos_pred'],
-                        s['TP'], s['FP'], s['FN'], s['precision'], s['recall']])
-
-# --------- CLI ---------
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(
-        description="Evaluate IR-drop predictions: MAE, F1 (>=90% per testcase), and runtime (model forward)."
-    )
-    sub = ap.add_subparsers(dest="mode")
-
-    a = sub.add_parser("from_spice", help="Run full evaluation from .sp files (build GT, run model, time inference).")
-    a.add_argument("--spice_dir", required=True)
-    a.add_argument("--ml_model", required=True)
-    a.add_argument("--pred_out", required=True)
-    a.add_argument("--gt_out", required=True)
-    a.add_argument("--device", default="cpu", choices=["cpu","cuda"])
-    a.add_argument("--csv_out")
-    a.add_argument("--debug", action="store_true")
-
-    b = sub.add_parser("from_dirs", help="Evaluate from precomputed CSVs.")
-    b.add_argument("-pred_dir", required=True)
-    b.add_argument("-true_dir", required=True)
-    b.add_argument("--csv_out")
-    b.add_argument("--debug", action="store_true")
-
-    args = ap.parse_args()
-    if args.mode == "from_spice":
-        eval_from_spice(args.spice_dir, args.ml_model, args.pred_out, args.gt_out,
-                        debug=args.debug, csv_out=args.csv_out, device=args.device)
-    elif args.mode == "from_dirs":
-        eval_from_dirs(args.pred_dir, args.true_dir, debug=args.debug, csv_out=args.csv_out)
+    # Import appropriate model
+    if variable_size:
+        from models.resunet import VariableSizeResUNet
+        model = VariableSizeResUNet(target_size=target_size)
     else:
-        ap.print_help()
-        sys.exit(1)
+        from models.resunet import ResUNet
+        model = ResUNet()
+    
+    # Load model weights
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    model.eval()
+    
+    return model, norm_info
+
+def preprocess_for_evaluation(spice_netlist, voltage_file, output_dir, target_size=256):
+    """
+    Preprocess input data for evaluation.
+    """
+    # Determine grid size for this netlist
+    grid_size = determine_grid_size(spice_netlist)
+    
+    # Generate maps
+    generate_maps(spice_netlist, voltage_file, output_dir, grid_size)
+    
+    # Load maps
+    base = os.path.splitext(os.path.basename(spice_netlist))[0]
+    
+    current_map = np.loadtxt(os.path.join(output_dir, f"current_map_{base}.csv"), delimiter=",")
+    density_map = np.loadtxt(os.path.join(output_dir, f"pdn_density_map_{base}.csv"), delimiter=",")
+    vsrc_map = np.loadtxt(os.path.join(output_dir, f"voltage_source_map_{base}.csv"), delimiter=",")
+    ground_truth = np.loadtxt(os.path.join(output_dir, f"ir_drop_map_{base}.csv"), delimiter=",")
+    
+    # Resize to target size if needed
+    if current_map.shape[0] != target_size or current_map.shape[1] != target_size:
+        current_map = cv2.resize(current_map, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        density_map = cv2.resize(density_map, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        vsrc_map = cv2.resize(vsrc_map, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        ground_truth = cv2.resize(ground_truth, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+    
+    # Normalize inputs
+    def norm(x):
+        mx = np.max(np.abs(x))
+        return x / (mx + 1e-12)
+    
+    X = np.stack([norm(current_map), norm(density_map), norm(vsrc_map)], axis=0)
+    X = torch.tensor(X, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
+    
+    return X, ground_truth, base, grid_size
+
+def calculate_metrics(prediction, ground_truth):
+    """
+    Calculate comprehensive evaluation metrics.
+    """
+    # Flatten arrays for metric calculation
+    pred_flat = prediction.flatten()
+    gt_flat = ground_truth.flatten()
+    
+    # Basic regression metrics
+    mae = mean_absolute_error(gt_flat, pred_flat)
+    mse = mean_squared_error(gt_flat, pred_flat)
+    rmse = np.sqrt(mse)
+    
+    # Correlation
+    correlation, p_value = pearsonr(gt_flat, pred_flat)
+    
+    # Relative errors
+    rel_mae = mae / (np.max(gt_flat) + 1e-12)
+    rel_rmse = rmse / (np.max(gt_flat) + 1e-12)
+    
+    # Peak error
+    peak_error = np.max(np.abs(pred_flat - gt_flat))
+    
+    # Hotspot detection metrics
+    hotspot_metrics = calculate_hotspot_metrics(prediction, ground_truth)
+    
+    return {
+        'mae': mae,
+        'mse': mse,
+        'rmse': rmse,
+        'correlation': correlation,
+        'p_value': p_value,
+        'relative_mae': rel_mae,
+        'relative_rmse': rel_rmse,
+        'peak_error': peak_error,
+        'hotspot_metrics': hotspot_metrics
+    }
+
+def calculate_hotspot_metrics(prediction, ground_truth, threshold_percentile=90):
+    """
+    Calculate hotspot detection accuracy metrics.
+    """
+    # Create hotspot masks
+    gt_threshold = np.percentile(ground_truth, threshold_percentile)
+    pred_threshold = np.percentile(prediction, threshold_percentile)
+    
+    gt_hotspots = ground_truth >= gt_threshold
+    pred_hotspots = prediction >= pred_threshold
+    
+    # Calculate intersection over union (IoU)
+    intersection = np.logical_and(gt_hotspots, pred_hotspots).sum()
+    union = np.logical_or(gt_hotspots, pred_hotspots).sum()
+    iou = intersection / (union + 1e-12)
+    
+    # Calculate precision and recall
+    tp = intersection
+    fp = pred_hotspots.sum() - intersection
+    fn = gt_hotspots.sum() - intersection
+    
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    f1_score = 2 * (precision * recall) / (precision + recall + 1e-12)
+    
+    # Calculate hotspot area accuracy
+    gt_area = gt_hotspots.sum()
+    pred_area = pred_hotspots.sum()
+    area_accuracy = 1 - abs(gt_area - pred_area) / (gt_area + 1e-12)
+    
+    # Calculate hotspot intensity correlation
+    if gt_hotspots.sum() > 0 and pred_hotspots.sum() > 0:
+        gt_hotspot_intensities = ground_truth[gt_hotspots]
+        pred_hotspot_intensities = prediction[pred_hotspots]
+        
+        # Resample to same size for correlation
+        min_size = min(len(gt_hotspot_intensities), len(pred_hotspot_intensities))
+        if min_size > 1:
+            gt_sample = np.random.choice(gt_hotspot_intensities, min_size, replace=False)
+            pred_sample = np.random.choice(pred_hotspot_intensities, min_size, replace=False)
+            hotspot_correlation, _ = pearsonr(gt_sample, pred_sample)
+        else:
+            hotspot_correlation = 0.0
+    else:
+        hotspot_correlation = 0.0
+    
+    return {
+        'iou': iou,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score,
+        'area_accuracy': area_accuracy,
+        'hotspot_correlation': hotspot_correlation,
+        'gt_hotspot_area': int(gt_hotspots.sum()),
+        'pred_hotspot_area': int(pred_hotspots.sum())
+    }
+
+def evaluate_single_file(spice_netlist, voltage_file, model_path, output_dir, 
+                        norm_info_path=None, save_visualization=True):
+    """
+    Evaluate model performance on a single file.
+    """
+    print(f"[INFO] Evaluating {os.path.basename(spice_netlist)}...")
+    
+    # Load model
+    model, norm_info = load_model(model_path, norm_info_path)
+    target_size = norm_info.get('target_size', 256)
+    
+    # Preprocess data
+    X, ground_truth, base, original_grid_size = preprocess_for_evaluation(
+        spice_netlist, voltage_file, output_dir, target_size
+    )
+    
+    # Run prediction
+    with torch.no_grad():
+        prediction = model(X)
+        prediction = prediction.squeeze().numpy()
+    
+    # Denormalize if needed
+    if norm_info.get('label_normalization') == 'per_sample_max':
+        # Use ground truth max for denormalization
+        gt_max = np.max(ground_truth) if np.max(ground_truth) > 0 else 1.0
+        prediction = prediction * gt_max
+    
+    # Calculate metrics
+    metrics = calculate_metrics(prediction, ground_truth)
+    
+    # Save results
+    results = {
+        'file': base,
+        'original_grid_size': original_grid_size,
+        'processed_grid_size': target_size,
+        'metrics': metrics,
+        'prediction_range': [float(np.min(prediction)), float(np.max(prediction))],
+        'ground_truth_range': [float(np.min(ground_truth)), float(np.max(ground_truth))]
+    }
+    
+    # Save prediction
+    prediction_path = os.path.join(output_dir, f"predicted_ir_drop_{base}.csv")
+    np.savetxt(prediction_path, prediction, delimiter=",")
+    
+    # Save visualization
+    if save_visualization:
+        save_evaluation_visualization(prediction, ground_truth, metrics, 
+                                    os.path.join(output_dir, f"evaluation_{base}.png"), base)
+    
+    # Print summary
+    print(f"  - MAE: {metrics['mae']:.6f}")
+    print(f"  - RMSE: {metrics['rmse']:.6f}")
+    print(f"  - Correlation: {metrics['correlation']:.4f}")
+    print(f"  - Hotspot IoU: {metrics['hotspot_metrics']['iou']:.4f}")
+    print(f"  - Hotspot F1: {metrics['hotspot_metrics']['f1_score']:.4f}")
+    
+    return results
+
+def save_evaluation_visualization(prediction, ground_truth, metrics, save_path, title):
+    """
+    Create comprehensive evaluation visualization.
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # Main predictions
+    im1 = axes[0,0].imshow(prediction, cmap='hot', interpolation='nearest')
+    axes[0,0].set_title(f"Prediction\nRange: [{metrics['prediction_range'][0]:.4f}, {metrics['prediction_range'][1]:.4f}]")
+    plt.colorbar(im1, ax=axes[0,0], fraction=0.046, pad=0.04)
+    
+    im2 = axes[0,1].imshow(ground_truth, cmap='hot', interpolation='nearest')
+    axes[0,1].set_title(f"Ground Truth\nRange: [{metrics['ground_truth_range'][0]:.4f}, {metrics['ground_truth_range'][1]:.4f}]")
+    plt.colorbar(im2, ax=axes[0,1], fraction=0.046, pad=0.04)
+    
+    # Error map
+    error_map = np.abs(prediction - ground_truth)
+    im3 = axes[0,2].imshow(error_map, cmap='viridis', interpolation='nearest')
+    axes[0,2].set_title(f"Absolute Error\nMAE: {metrics['mae']:.6f}")
+    plt.colorbar(im3, ax=axes[0,2], fraction=0.046, pad=0.04)
+    
+    # Hotspot comparison
+    gt_threshold = np.percentile(ground_truth, 90)
+    pred_threshold = np.percentile(prediction, 90)
+    
+    gt_hotspots = ground_truth >= gt_threshold
+    pred_hotspots = prediction >= pred_threshold
+    
+    axes[1,0].imshow(gt_hotspots, cmap='gray', interpolation='nearest')
+    axes[1,0].set_title(f"Ground Truth Hotspots\nArea: {metrics['hotspot_metrics']['gt_hotspot_area']}")
+    
+    axes[1,1].imshow(pred_hotspots, cmap='gray', interpolation='nearest')
+    axes[1,1].set_title(f"Predicted Hotspots\nArea: {metrics['hotspot_metrics']['pred_hotspot_area']}")
+    
+    # Scatter plot
+    axes[1,2].scatter(ground_truth.flatten(), prediction.flatten(), alpha=0.1, s=1)
+    axes[1,2].plot([0, np.max(ground_truth)], [0, np.max(ground_truth)], 'r--', alpha=0.8)
+    axes[1,2].set_xlabel('Ground Truth')
+    axes[1,2].set_ylabel('Prediction')
+    axes[1,2].set_title(f'Correlation: {metrics["correlation"]:.4f}')
+    axes[1,2].grid(True, alpha=0.3)
+    
+    for ax in axes.flat:
+        ax.axis('off')
+    
+    plt.suptitle(f'Evaluation Results: {title}', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def batch_evaluate(input_dir, model_path, output_dir, norm_info_path=None):
+    """
+    Evaluate model performance on all files in a directory.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Find all SPICE files
+    spice_files = [f for f in os.listdir(input_dir) if f.endswith('.sp')]
+    
+    if not spice_files:
+        print(f"[ERROR] No SPICE files found in {input_dir}")
+        return
+    
+    print(f"[INFO] Found {len(spice_files)} SPICE files for evaluation")
+    
+    all_results = []
+    
+    for spice_file in spice_files:
+        spice_path = os.path.join(input_dir, spice_file)
+        base = os.path.splitext(spice_file)[0]
+        voltage_file = os.path.join(input_dir, "generated_features", f"{base}.voltage")
+        
+        # Check if voltage file exists, if not solve MNA
+        if not os.path.exists(voltage_file):
+            print(f"[INFO] Solving MNA for {spice_file}...")
+            solve_ir_drop(spice_path, voltage_file)
+        
+        try:
+            results = evaluate_single_file(
+                spice_path, voltage_file, model_path, output_dir,
+                norm_info_path, save_visualization=True
+            )
+            all_results.append(results)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to evaluate {spice_file}: {e}")
+            continue
+    
+    # Calculate aggregate metrics
+    if all_results:
+        aggregate_metrics = calculate_aggregate_metrics(all_results)
+        
+        # Save comprehensive results
+        save_comprehensive_results(all_results, aggregate_metrics, output_dir)
+        
+        # Print summary
+        print(f"\n[SUMMARY] Evaluation completed:")
+        print(f"  - Total files: {len(spice_files)}")
+        print(f"  - Successful evaluations: {len(all_results)}")
+        print(f"  - Average MAE: {aggregate_metrics['avg_mae']:.6f}")
+        print(f"  - Average RMSE: {aggregate_metrics['avg_rmse']:.6f}")
+        print(f"  - Average Correlation: {aggregate_metrics['avg_correlation']:.4f}")
+        print(f"  - Average Hotspot IoU: {aggregate_metrics['avg_hotspot_iou']:.4f}")
+        print(f"  - Average Hotspot F1: {aggregate_metrics['avg_hotspot_f1']:.4f}")
+
+def calculate_aggregate_metrics(results):
+    """
+    Calculate aggregate metrics across all results.
+    """
+    metrics_list = [r['metrics'] for r in results]
+    
+    aggregate = {
+        'avg_mae': np.mean([m['mae'] for m in metrics_list]),
+        'avg_mse': np.mean([m['mse'] for m in metrics_list]),
+        'avg_rmse': np.mean([m['rmse'] for m in metrics_list]),
+        'avg_correlation': np.mean([m['correlation'] for m in metrics_list]),
+        'avg_relative_mae': np.mean([m['relative_mae'] for m in metrics_list]),
+        'avg_relative_rmse': np.mean([m['relative_rmse'] for m in metrics_list]),
+        'avg_peak_error': np.mean([m['peak_error'] for m in metrics_list]),
+        'avg_hotspot_iou': np.mean([m['hotspot_metrics']['iou'] for m in metrics_list]),
+        'avg_hotspot_precision': np.mean([m['hotspot_metrics']['precision'] for m in metrics_list]),
+        'avg_hotspot_recall': np.mean([m['hotspot_metrics']['recall'] for m in metrics_list]),
+        'avg_hotspot_f1': np.mean([m['hotspot_metrics']['f1_score'] for m in metrics_list]),
+        'avg_hotspot_area_accuracy': np.mean([m['hotspot_metrics']['area_accuracy'] for m in metrics_list]),
+        'avg_hotspot_correlation': np.mean([m['hotspot_metrics']['hotspot_correlation'] for m in metrics_list])
+    }
+    
+    return aggregate
+
+def save_comprehensive_results(results, aggregate_metrics, output_dir):
+    """
+    Save comprehensive evaluation results.
+    """
+    # Save detailed results
+    detailed_results = {
+        'individual_results': results,
+        'aggregate_metrics': aggregate_metrics,
+        'evaluation_summary': {
+            'total_files': len(results),
+            'evaluation_timestamp': str(np.datetime64('now'))
+        }
+    }
+    
+    with open(os.path.join(output_dir, 'comprehensive_evaluation_results.json'), 'w') as f:
+        json.dump(detailed_results, f, indent=2)
+    
+    # Save metrics summary as CSV
+    import pandas as pd
+    
+    # Individual file metrics
+    individual_data = []
+    for result in results:
+        row = {
+            'file': result['file'],
+            'mae': result['metrics']['mae'],
+            'rmse': result['metrics']['rmse'],
+            'correlation': result['metrics']['correlation'],
+            'hotspot_iou': result['metrics']['hotspot_metrics']['iou'],
+            'hotspot_f1': result['metrics']['hotspot_metrics']['f1_score'],
+            'hotspot_precision': result['metrics']['hotspot_metrics']['precision'],
+            'hotspot_recall': result['metrics']['hotspot_metrics']['recall']
+        }
+        individual_data.append(row)
+    
+    df_individual = pd.DataFrame(individual_data)
+    df_individual.to_csv(os.path.join(output_dir, 'individual_metrics.csv'), index=False)
+    
+    # Aggregate metrics
+    aggregate_data = [aggregate_metrics]
+    df_aggregate = pd.DataFrame(aggregate_data)
+    df_aggregate.to_csv(os.path.join(output_dir, 'aggregate_metrics.csv'), index=False)
+    
+    print(f"[INFO] Comprehensive results saved to {output_dir}")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Evaluate enhanced IR drop prediction model")
+    ap.add_argument("-spice", type=str, help="Path to SPICE netlist file (.sp)")
+    ap.add_argument("-voltage", type=str, help="Path to voltage output file from MNA solver")
+    ap.add_argument("-model", type=str, required=True, help="Path to trained model (.pt)")
+    ap.add_argument("-output", type=str, required=True, help="Directory to save evaluation results")
+    ap.add_argument("-norm_info", type=str, help="Path to normalization info file (.json)")
+    ap.add_argument("--batch", action="store_true", help="Run batch evaluation on directory")
+    ap.add_argument("--input_dir", type=str, help="Input directory for batch evaluation")
+    ap.add_argument("--no_viz", action="store_true", help="Disable visualization")
+    args = ap.parse_args()
+
+    if args.batch:
+        if not args.input_dir:
+            print("[ERROR] --input_dir required for batch evaluation")
+            sys.exit(1)
+        batch_evaluate(args.input_dir, args.model, args.output, args.norm_info)
+    else:
+        if not args.spice or not args.voltage:
+            print("[ERROR] -spice and -voltage required for single file evaluation")
+            sys.exit(1)
+        evaluate_single_file(args.spice, args.voltage, args.model, args.output,
+                           args.norm_info, save_visualization=not args.no_viz)
 
